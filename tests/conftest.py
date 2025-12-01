@@ -2,12 +2,15 @@ import socket
 import subprocess
 import time
 import logging
+import os
+from pathlib import Path
 from typing import Generator, Dict, List
 from contextlib import contextmanager
 
 import pytest
 import requests
 from faker import Faker
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 from playwright.sync_api import sync_playwright, Browser, Page
@@ -84,6 +87,33 @@ class ServerStartupError(Exception):
     pass
 
 # ======================================================================================
+# Helper to find project root
+# ======================================================================================
+def get_project_root() -> Path:
+    """
+    Find the project root directory by looking for common markers.
+    Starts from the current file and walks up the directory tree.
+    """
+    current = Path(__file__).resolve().parent
+    
+    # Walk up the directory tree looking for project root indicators
+    for parent in [current] + list(current.parents):
+        # Check for common project root indicators
+        if (parent / "app").is_dir() and (parent / "app" / "main.py").exists():
+            return parent
+        if (parent / "pyproject.toml").exists():
+            return parent
+        if (parent / "setup.py").exists():
+            return parent
+    
+    # If we're in a 'tests' directory, go up one level
+    if current.name == "tests":
+        return current.parent
+    
+    # Default to current directory's parent
+    return current.parent
+
+# ======================================================================================
 # Database Fixtures
 # ======================================================================================
 @pytest.fixture(scope="session", autouse=True)
@@ -93,10 +123,36 @@ def setup_test_database(request):
     unless --preserve-db is provided.
     """
     logger.info("Setting up test database...")
+    
+    def drop_all_tables_cascade():
+        """Drop all tables using CASCADE to handle foreign keys."""
+        try:
+            with test_engine.connect() as conn:
+                # Get all table names in the public schema
+                result = conn.execute(text("""
+                    SELECT tablename FROM pg_tables 
+                    WHERE schemaname = 'public'
+                """))
+                tables = [row[0] for row in result]
+                
+                if tables:
+                    # Drop each table with CASCADE
+                    for table in tables:
+                        logger.info(f"Dropping table: {table}")
+                        conn.execute(text(f'DROP TABLE IF EXISTS "{table}" CASCADE'))
+                    
+                    conn.commit()
+                    logger.info(f"Successfully dropped {len(tables)} tables with CASCADE.")
+        except Exception as e:
+            logger.error(f"Error dropping tables: {e}")
+            raise
+    
     try:
-        Base.metadata.drop_all(bind=test_engine)
+        # First, drop all existing tables with CASCADE
+        drop_all_tables_cascade()
+        
+        # Now create all tables fresh
         Base.metadata.create_all(bind=test_engine)
-        init_db()
         logger.info("Test database initialized.")
     except Exception as e:
         logger.error(f"Error setting up test database: {str(e)}")
@@ -104,25 +160,13 @@ def setup_test_database(request):
 
     yield  # Tests run after this
 
+    # Cleanup after all tests
     if not request.config.getoption("--preserve-db"):
         logger.info("Dropping test database tables...")
-        drop_db()
-
-@pytest.fixture
-def db_session() -> Generator[Session, None, None]:
-    """
-    Provide a test-scoped database session. Commits after a successful test;
-    rolls back if an exception occurs.
-    """
-    session = TestingSessionLocal()
-    try:
-        yield session
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+        try:
+            drop_all_tables_cascade()
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
 
 # ======================================================================================
 # Test Data Fixtures
@@ -185,12 +229,16 @@ def fastapi_server():
 
     logger.info(f"Starting FastAPI server on port {base_port}...")
 
+    # CRITICAL FIX: Get the project root directory
+    project_root = get_project_root()
+    logger.info(f"Project root directory: {project_root}")
+
     process = subprocess.Popen(
         ['uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', str(base_port)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        cwd='.'  # ensure the working directory is set correctly
+        cwd=str(project_root)  # Run from project root, not from tests/
     )
 
     # IMPORTANT: Use the /health endpoint for the check!
@@ -256,8 +304,8 @@ def page(browser_context: Browser):
 def pytest_addoption(parser):
     """
     Add custom command line options:
-      --preserve-db : Keep test database after tests
-      --run-slow    : Run tests marked as 'slow'
+    --preserve-db : Keep test database after tests
+    --run-slow    : Run tests marked as 'slow'
     """
     parser.addoption("--preserve-db", action="store_true", help="Keep test database after tests")
     parser.addoption("--run-slow", action="store_true", help="Run tests marked as slow")
